@@ -1,8 +1,8 @@
 # Financial Statement Analyzer
 
-A web app that analyzes any U.S. public company's financial statements using data pulled directly from its SEC filings. Type a ticker to see five years of financials, nine key ratios, and automatic red-flag checks.
+A web app that analyzes any U.S. public company's financial statements using data pulled directly from its SEC filings. Type a ticker to see five years of financials, twelve key ratios, free cash flow, and automatic red-flag checks.
 
-**Live app:** _link coming soon_
+**Live app:** https://raymond-edgar-analyzer.streamlit.app
 
 ## Features
 
