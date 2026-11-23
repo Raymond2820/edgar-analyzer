@@ -263,6 +263,16 @@ link.link_button(
 )
 st.write("")
 
+if red_flags.looks_like_financial_company(all_financials):
+    st.info(
+        "**This looks like a bank, insurer or other financial company.** Its balance "
+        "sheet isn't split into current and noncurrent, deposits count as liabilities, "
+        "and operating cash flow mostly reflects lending and trading. Ratios like "
+        "current ratio, liabilities to equity and cash flow to net income don't mean "
+        "the same thing here, so the cash flow red flags are skipped. Banks are "
+        "usually judged on measures like net interest margin and capital ratios instead."
+    )
+
 overview_tab, ratios_tab, flags_tab, statements_tab = st.tabs(
     ["Overview", "Ratios", f"Red flags ({len(flags)})", "Financial statements"]
 )
@@ -364,12 +374,14 @@ with flags_tab:
             f"- **Liquidity:** flagged when the current ratio is below "
             f"{red_flags.LOW_CURRENT_RATIO:.1f}x\n"
             f"- **Leverage:** flagged when liabilities to equity rises "
-            f"{red_flags.LEVERAGE_JUMP:.2f}x or more\n"
+            f"{red_flags.LEVERAGE_GROWTH:.0%} or more in a year\n"
             f"- **Non-operating earnings:** flagged when net income outgrows operating "
             f"income by more than {red_flags.GROWTH_GAP * 100:.0f} percentage points\n"
             "- **Free cash flow:** flagged when capital expenditures exceed operating "
             "cash flow\n"
-            "- Also flags revenue declines, net losses and negative equity."
+            "- Also flags revenue declines, net losses and negative equity.\n"
+            "- **Banks and insurers:** the cash flow checks are skipped, since "
+            "their operating cash flow mostly reflects lending and trading activity."
         )
 
 # --- Financial statements tab -----------------------------------------------

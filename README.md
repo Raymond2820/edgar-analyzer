@@ -21,6 +21,8 @@ A web app that analyzes any U.S. public company's financial statements using dat
 - **Restatements.** When a balance is reported in several filings, the most recently filed figure is used.
 - **Negative equity.** Ratios that divide by equity show n/a when equity is zero or negative, since the result isn't meaningful.
 - **Materiality.** Receivables and inventory checks are skipped when the balance is under 1% of total assets.
+- **Banks and insurers.** Financial companies are recognized by their unclassified balance sheets (no current assets or liabilities). Their operating cash flow mostly reflects lending and trading, so the cash flow red flags are skipped and the app explains why.
+- **Leverage changes.** The leverage flag uses the percentage change in liabilities to equity, so it scales with each company's normal level.
 - **Inconsistent tagging.** Companies use different XBRL tags for the same line item, so the app checks several common tags for each one. Total liabilities and gross profit are calculated when a company doesn't tag them directly, and the source table marks those figures as calculated.
 
 ## Validation
