@@ -1,0 +1,9 @@
+# Streamlit theme: colors and font for the whole app.
+# This file lives in the .streamlit folder inside your project.
+[theme]
+base = "light"
+primaryColor = "#1F4E79"              # buttons, links, selected tab
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F3F6F9"  # sidebar and input boxes
+textColor = "#1A1F2B"
+font = "sans serif"
