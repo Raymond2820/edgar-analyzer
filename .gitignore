@@ -1,5 +1,6 @@
 # Files Git should never upload
 .venv/
 __pycache__/
+.pytest_cache/
 .DS_Store
 .streamlit/secrets.toml

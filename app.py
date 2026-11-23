@@ -6,6 +6,7 @@ Run it from Terminal (with your virtual environment turned on):
 """
 
 import html
+from datetime import date
 
 import altair as alt
 import pandas as pd
@@ -15,7 +16,16 @@ import streamlit as st
 # and this file displays it
 import red_flags
 from analysis import compute_ratios
-from fetch_data import build_financials, get_cik, get_company_facts
+from fetch_data import (
+    SecDataError,
+    build_financials,
+    clean_ticker,
+    get_cik,
+    get_company_facts,
+    get_sic_code,
+    get_ticker_table,
+    unsupported_reason,
+)
 
 st.set_page_config(page_title="EDGAR Analyzer", page_icon="📊", layout="wide")
 
@@ -126,6 +136,21 @@ def show_years_as_text(table):
     return table
 
 
+def format_date(iso_date):
+    """Turn "2026-01-31" into "Jan 31, 2026"."""
+    day = date.fromisoformat(iso_date)
+    return f"{day:%b} {day.day}, {day.year}"
+
+
+def show_no_flags_message(unavailable):
+    """Say no flags were found, without implying checks passed if they couldn't run."""
+    if unavailable:
+        st.info(f"No red flags in the checks that could run. {len(unavailable)} "
+                "couldn't run because the company doesn't report the needed line items.")
+    else:
+        st.success("No red flags found by the automatic checks.")
+
+
 # --- Charts ------------------------------------------------------------------
 def money_chart(fin_millions):
     """Grouped bars: revenue, net income and cash flows by year."""
@@ -158,14 +183,36 @@ def ratio_chart(series, kind):
 
 # --- Data loading ------------------------------------------------------------
 # Streamlit re-runs this whole script every time you interact with the page.
-# @st.cache_data remembers the result for an hour, so searching the same
-# ticker again doesn't re-download the company's data from the SEC.
-@st.cache_data(ttl=3600)
+# @st.cache_data remembers results, so searching the same ticker again doesn't
+# re-download the company's data from the SEC. Errors are never cached.
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_ticker_table():
+    return get_ticker_table()
+
+
+# Only the finished tables are cached, not the SEC's full download (often
+# several MB per company), and max_entries caps how much memory the app can use.
+@st.cache_data(ttl=3600, max_entries=200, show_spinner=False)
 def load_company(ticker):
-    cik, name = get_cik(ticker)
+    cik, name = get_cik(ticker, load_ticker_table())
     if cik is None:
-        return None, None, None
-    return cik, name, get_company_facts(cik)
+        return None
+    facts = get_company_facts(cik)
+    problem = unsupported_reason(facts)
+    if problem:
+        return {"cik": cik, "name": name, "problem": problem}
+    financials, sources, year_ends = build_financials(facts)
+    # The industry code only matters for companies with no current/noncurrent split
+    needs_sic = not financials.empty and red_flags.has_unclassified_balance_sheet(financials)
+    return {
+        "cik": cik,
+        "name": name,
+        "problem": None,
+        "financials": financials,
+        "sources": sources,
+        "year_ends": year_ends,
+        "sic": get_sic_code(cik) if needs_sic else None,
+    }
 
 
 def pick_ticker(ticker):
@@ -182,14 +229,14 @@ with st.sidebar:
         st.markdown(
             "- Numbers come from the SEC's XBRL data: the tagged figures in each "
             "company's 10-K filings.\n"
-            "- Years are the SEC's calendar-year buckets, matched to each company's "
-            "fiscal year-end.\n"
+            "- Years are each company's own fiscal years, using only full-year "
+            "figures from annual reports.\n"
             "- Returns and turnover ratios use average balances "
             "(beginning + ending ÷ 2).\n"
             "- Companies tag line items differently, so some ratios can show n/a."
         )
 
-ticker = st.session_state.get("ticker", "").strip().upper()
+ticker = clean_ticker(st.session_state.get("ticker", ""))
 
 # --- Landing page (nothing searched yet) -----------------------------------
 if not ticker:
@@ -220,17 +267,27 @@ if not ticker:
     st.stop()
 
 # --- Load and calculate ------------------------------------------------------
-with st.spinner(f"Downloading {ticker} filings from EDGAR..."):
-    cik, name, facts = load_company(ticker)
+try:
+    with st.spinner(f"Downloading {ticker} filings from EDGAR..."):
+        company = load_company(ticker)
+except SecDataError as error:
+    st.error(str(error))
+    st.stop()
 
-if cik is None:
+if company is None:
     st.error(f"Couldn't find a company with ticker **{ticker}**. Check the spelling "
              "and try again.")
     st.stop()
 
+cik, name = company["cik"], company["name"]
+if company["problem"]:
+    st.warning(f"**{name}** {company['problem']}")
+    st.stop()
+
 # Ratios use every year available (averages need the prior year's balance),
 # then we keep only the last five years for display.
-all_financials, sources = build_financials(facts)
+all_financials, sources = company["financials"], company["sources"]
+year_ends, sic = company["year_ends"], company["sic"]
 if len(all_financials) < 2:
     st.warning(
         f"**{name}** doesn't have at least two years of annual financial data "
@@ -241,7 +298,8 @@ if len(all_financials) < 2:
     st.stop()
 
 all_ratios = compute_ratios(all_financials)
-flags = red_flags.check_red_flags(all_financials, all_ratios)
+flags = red_flags.check_red_flags(all_financials, all_ratios, sic)
+unavailable_checks = red_flags.checks_missing_data(all_financials, sic)
 
 ratios = show_years_as_text(all_ratios.tail(5))
 financials = show_years_as_text(all_financials.tail(5))  # in dollars
@@ -254,7 +312,8 @@ header.markdown(
     f'<div class="company-name">{html.escape(name)}</div>'
     f'<span class="chip">{html.escape(ticker)}</span>'
     f'<span class="chip">CIK {cik}</span>'
-    f'<span class="chip">Fiscal {latest}</span>',
+    f'<span class="chip">Fiscal {latest}</span>'
+    f'<span class="chip">Year ended {format_date(year_ends[int(latest)])}</span>',
     unsafe_allow_html=True,
 )
 link.link_button(
@@ -263,7 +322,7 @@ link.link_button(
 )
 st.write("")
 
-if red_flags.looks_like_financial_company(all_financials):
+if red_flags.looks_like_financial_company(all_financials, sic):
     st.info(
         "**This looks like a bank, insurer or other financial company.** Its balance "
         "sheet isn't split into current and noncurrent, deposits count as liabilities, "
@@ -305,7 +364,7 @@ with overview_tab:
     with flag_side.container(border=True):
         st.markdown("**Red flags**")
         if not flags:
-            st.success("No red flags found by the automatic checks.")
+            show_no_flags_message(unavailable_checks)
         for flag in flags:
             st.markdown(f"⚠️ {flag['title']}")
         if flags:
@@ -354,12 +413,14 @@ with flags_tab:
     st.caption(f"Checks compare {latest} with {prior}. A red flag isn't proof of a "
                "problem; it's a reason to read the footnotes and MD&A more closely.")
     if not flags:
-        st.success("No red flags found by the automatic checks.")
+        show_no_flags_message(unavailable_checks)
     for flag in flags:
         with st.container(border=True):
             st.markdown(f"##### ⚠️ {flag['title']}")
             st.write(flag["detail"])
             st.caption(f"**Why it matters:** {flag['why']}")
+    if unavailable_checks:
+        st.caption("**Couldn't run (missing line items):** " + "; ".join(unavailable_checks))
 
     with st.expander("How the checks work"):
         st.markdown(
@@ -386,7 +447,7 @@ with flags_tab:
 
 # --- Financial statements tab -----------------------------------------------
 with statements_tab:
-    st.caption("$ millions, as tagged in the company's 10-K filings.")
+    st.caption("$ millions, as tagged in the company's annual reports.")
     in_millions = financials / 1_000_000
     for statement, items in STATEMENTS.items():
         st.markdown(f"#### {statement}")
