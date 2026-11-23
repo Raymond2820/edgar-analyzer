@@ -232,7 +232,12 @@ if cik is None:
 # then we keep only the last five years for display.
 all_financials, sources = build_financials(facts)
 if len(all_financials) < 2:
-    st.warning(f"Not enough annual data found for {name}.")
+    st.warning(
+        f"**{name}** doesn't have at least two years of annual financial data "
+        "in the SEC's XBRL records yet. This tool uses 10-K figures, so a company "
+        "that recently went public won't show up until it has filed its annual "
+        "reports."
+    )
     st.stop()
 
 all_ratios = compute_ratios(all_financials)

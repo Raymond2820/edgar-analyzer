@@ -107,8 +107,20 @@ def get_company_facts(cik):
     # EDGAR wants the CIK padded to 10 digits, e.g. 320193 -> 0000320193
     url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
     response = requests.get(url, headers=HEADERS)
+    if response.status_code == 404:
+        return {}  # the company hasn't filed any XBRL financial data yet
     response.raise_for_status()  # stop with a clear error if the download failed
     return response.json()
+
+
+def us_gaap_facts(facts):
+    """
+    The company's US GAAP figures, or an empty dict if it has none yet.
+
+    A company that just went public may be in the SEC's ticker list before it
+    has filed any financial statements, so its data can be missing entirely.
+    """
+    return facts.get("facts", {}).get("us-gaap", {})
 
 
 # Each "entry" below is one reported number as the SEC gives it to us:
@@ -117,7 +129,7 @@ def get_company_facts(cik):
 
 def get_annual_entries(facts, tags):
     """Find one full-year entry per year for a line item, checking each tag in turn."""
-    us_gaap = facts["facts"]["us-gaap"]
+    us_gaap = us_gaap_facts(facts)
     yearly = {}
     for tag in tags:
         if tag not in us_gaap:
@@ -147,7 +159,7 @@ def get_year_end_dates(facts, tags):
 
 def get_balance_entries(facts, tags, year_ends):
     """Find the balance on each fiscal year-end date for a balance sheet item."""
-    us_gaap = facts["facts"]["us-gaap"]
+    us_gaap = us_gaap_facts(facts)
     yearly = {}
     for tag in tags:
         if tag not in us_gaap:
