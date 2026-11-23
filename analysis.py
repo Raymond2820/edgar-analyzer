@@ -37,7 +37,9 @@ def compute_ratios(fin):
     ratios = pd.DataFrame(index=fin.index)
 
     avg_assets = average_balance(fin["Total assets"])
-    avg_equity = only_if_positive(average_balance(fin["Stockholders' equity"]))
+    # Blank out negative balances first, so a year that starts or ends with
+    # negative equity shows n/a instead of dividing by a tiny, misleading average.
+    avg_equity = average_balance(only_if_positive(fin["Stockholders' equity"]))
 
     # --- Liquidity: can the company cover obligations due within a year?
     ratios["Current ratio"] = fin["Current assets"] / fin["Current liabilities"]

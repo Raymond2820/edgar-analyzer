@@ -7,6 +7,8 @@ Run it from Terminal (with your virtual environment turned on):
 
 import os
 import tomllib
+from collections import Counter
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -17,6 +19,20 @@ import requests
 # file, .streamlit/secrets.toml, which .gitignore stops from being uploaded:
 #     SEC_USER_AGENT = "Your Name your_email@example.com"
 SECRETS_FILE = Path(__file__).parent / ".streamlit" / "secrets.toml"
+
+REQUEST_TIMEOUT = 30  # seconds to wait for the SEC before giving up
+
+# A full fiscal year is 52 or 53 weeks, so allow a little room around 365 days.
+MIN_DAYS_IN_FISCAL_YEAR = 350
+MAX_DAYS_IN_FISCAL_YEAR = 380
+
+# Annual reports: 10-K for U.S. companies, 20-F and 40-F for foreign ones.
+# startswith() also matches amendments and transition reports like 10-K/A.
+ANNUAL_FORMS = ("10-K", "20-F", "40-F")
+
+
+class SecDataError(Exception):
+    """A problem getting SEC data, with a message that's safe to show on screen."""
 
 
 def get_user_agent():
@@ -36,23 +52,56 @@ def get_user_agent():
         return st.secrets["SEC_USER_AGENT"]
     except Exception:
         pass
-    raise RuntimeError(
-        "No SEC contact email found. Add this line to .streamlit/secrets.toml:\n"
+    raise SecDataError(
+        "No SEC contact email found. Add this line to .streamlit/secrets.toml:\n\n"
         'SEC_USER_AGENT = "Your Name your_email@example.com"'
     )
 
 
-HEADERS = {"User-Agent": get_user_agent()}
+def sec_get_json(url):
+    """Download JSON from the SEC. Returns None if the page doesn't exist."""
+    headers = {"User-Agent": get_user_agent()}
+    try:
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as error:
+        raise SecDataError(
+            "Couldn't reach the SEC. Check your connection and try again."
+        ) from error
+
+    if response.status_code == 404:
+        return None
+    if response.status_code in (403, 429):
+        raise SecDataError(
+            "The SEC is temporarily limiting requests from this app. "
+            "Wait a minute and try again."
+        )
+    if response.status_code >= 400:
+        raise SecDataError(
+            f"The SEC returned an error (HTTP {response.status_code}). Try again shortly."
+        )
+    try:
+        return response.json()
+    except ValueError as error:
+        raise SecDataError(
+            "The SEC sent back an unexpected response. Try again shortly."
+        ) from error
+
 
 # The line items we want, and the XBRL "tags" companies use for each one.
 # Companies don't all use the same tag for the same thing (and some switched
 # tags over the years), so we list the common ones and check all of them.
+# Order matters: for each year, the first tag with a value wins.
 
 # Income and cash flow statement items cover a period of time (a fiscal year).
 INCOME_ITEMS = {
+    # Total revenue tags come first. Contract revenue can leave out things like
+    # insurance premiums, leases and financing income, so it's only a fallback.
     "Revenue": [
-        "RevenueFromContractWithCustomerExcludingAssessedTax",
         "Revenues",
+        "RevenuesNetOfInterestExpense",
+        "RegulatedAndUnregulatedOperatingRevenue",
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "RevenueFromContractWithCustomerIncludingAssessedTax",
         "SalesRevenueNet",
     ],
     "Cost of revenue": [
@@ -62,7 +111,13 @@ INCOME_ITEMS = {
     ],
     "Gross profit": ["GrossProfit"],
     "Operating income": ["OperatingIncomeLoss"],
-    "Net income": ["NetIncomeLoss"],
+    # The parent company's share first. ProfitLoss also includes the share
+    # owned by outside investors, so it's the last resort.
+    "Net income": [
+        "NetIncomeLoss",
+        "NetIncomeLossAvailableToCommonStockholdersBasic",
+        "ProfitLoss",
+    ],
     # From the cash flow statement
     "Operating cash flow": [
         "NetCashProvidedByUsedInOperatingActivities",
@@ -72,6 +127,7 @@ INCOME_ITEMS = {
     "Capital expenditures": [
         "PaymentsToAcquirePropertyPlantAndEquipment",
         "PaymentsToAcquireProductiveAssets",
+        "PaymentsToAcquireOtherProductiveAssets",
     ],
 }
 
@@ -91,13 +147,29 @@ BALANCE_ITEMS = {
     ],
 }
 
+ALL_INCOME_TAGS = [tag for tags in INCOME_ITEMS.values() for tag in tags]
 
-def get_cik(ticker):
+
+def clean_ticker(ticker):
+    """Standardize a ticker. The SEC writes share classes with a dash: BRK.B -> BRK-B."""
+    return ticker.strip().upper().replace(".", "-").replace("/", "-")
+
+
+def get_ticker_table():
+    """Download the SEC's list of every ticker and its company."""
+    companies = sec_get_json("https://www.sec.gov/files/company_tickers.json")
+    if companies is None:
+        raise SecDataError("The SEC's ticker list is unavailable. Try again shortly.")
+    return companies
+
+
+def get_cik(ticker, companies=None):
     """Turn a ticker like 'AAPL' into the SEC's company ID number (CIK)."""
-    url = "https://www.sec.gov/files/company_tickers.json"
-    companies = requests.get(url, headers=HEADERS).json()
+    if companies is None:
+        companies = get_ticker_table()
+    wanted = clean_ticker(ticker)
     for company in companies.values():
-        if company["ticker"] == ticker.upper():
+        if clean_ticker(company["ticker"]) == wanted:
             return company["cik_str"], company["title"]
     return None, None
 
@@ -106,11 +178,22 @@ def get_company_facts(cik):
     """Download every number the company has reported in its XBRL filings."""
     # EDGAR wants the CIK padded to 10 digits, e.g. 320193 -> 0000320193
     url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
-    response = requests.get(url, headers=HEADERS)
-    if response.status_code == 404:
-        return {}  # the company hasn't filed any XBRL financial data yet
-    response.raise_for_status()  # stop with a clear error if the download failed
-    return response.json()
+    # None means the company hasn't filed any XBRL financial data yet
+    return sec_get_json(url) or {}
+
+
+def get_sic_code(cik):
+    """
+    The company's SEC industry code (SIC), or None if it isn't available.
+
+    It only refines the bank and insurer check, so a failed download here
+    shouldn't stop the rest of the analysis.
+    """
+    try:
+        profile = sec_get_json(f"https://data.sec.gov/submissions/CIK{cik:010d}.json")
+        return int(profile["sic"])
+    except (SecDataError, KeyError, TypeError, ValueError):
+        return None
 
 
 def us_gaap_facts(facts):
@@ -123,54 +206,146 @@ def us_gaap_facts(facts):
     return facts.get("facts", {}).get("us-gaap", {})
 
 
+def unsupported_reason(facts):
+    """
+    Explain why a company's filings can't be analyzed, or return None if they can.
+
+    Many foreign companies file under IFRS instead of US GAAP, or report in
+    their home currency. Neither fits the tags and dollar amounts used here.
+    """
+    taxonomies = facts.get("facts", {})
+    us_gaap = taxonomies.get("us-gaap", {})
+    if not us_gaap:
+        if "ifrs-full" in taxonomies:
+            return ("reports under IFRS (international accounting standards), and this "
+                    "tool currently supports only US GAAP filers.")
+        return None
+
+    all_tags = ALL_INCOME_TAGS + [tag for tags in BALANCE_ITEMS.values() for tag in tags]
+    currencies = {unit for tag in all_tags if tag in us_gaap for unit in us_gaap[tag]["units"]}
+    if currencies and "USD" not in currencies:
+        return (f"reports in {', '.join(sorted(currencies))}, and this tool currently "
+                "supports only U.S. dollar financial statements.")
+    return None
+
+
 # Each "entry" below is one reported number as the SEC gives it to us:
 # its value plus where it came from (form type, filing date, accession number).
 # We keep the whole entry, not just the value, so the app can show the source.
 
-def get_annual_entries(facts, tags):
-    """Find one full-year entry per year for a line item, checking each tag in turn."""
+def is_annual_report(entry):
+    """True if this number came from an annual report, not a 10-Q, 8-K or proxy."""
+    return entry.get("form", "").startswith(ANNUAL_FORMS)
+
+
+def is_full_year(entry):
+    """True if this number covers one 52- or 53-week fiscal year."""
+    if "start" not in entry:
+        return False
+    days = (date.fromisoformat(entry["end"]) - date.fromisoformat(entry["start"])).days
+    return MIN_DAYS_IN_FISCAL_YEAR <= days <= MAX_DAYS_IN_FISCAL_YEAR
+
+
+def usd_entries_oldest_first(facts, tag):
+    """All of a tag's dollar entries, sorted so the newest filing comes last."""
     us_gaap = us_gaap_facts(facts)
+    if tag not in us_gaap:
+        return []
+    return sorted(us_gaap[tag]["units"].get("USD", []), key=lambda e: e["filed"])
+
+
+def year_it_ended(end):
+    """The year a period ended. A 52/53-week year ending Jan 1-7 counts as the year before."""
+    return (end - timedelta(days=7)).year
+
+
+def fiscal_label_offset(main_entries):
+    """
+    How a company's fiscal-year names compare with the year each one ended.
+
+    0 means the year ended January 2026 is "fiscal 2026" (Walmart). -1 means
+    it's "fiscal 2025" (Home Depot). We use the most common pattern across
+    recent filings because a single filing can be mistagged.
+    """
+    newest_first = sorted(main_entries, key=lambda e: e["end"], reverse=True)[:5]
+    offsets = [entry["fy"] - year_it_ended(date.fromisoformat(entry["end"]))
+               for entry in newest_first if entry.get("fy") is not None]
+    offsets = [offset for offset in offsets if abs(offset) <= 1]
+    # On a tie, Counter keeps the first one it saw, which is the newest filing
+    return Counter(offsets).most_common(1)[0][0] if offsets else 0
+
+
+def get_fiscal_year_ends(facts):
+    """
+    Find the date each fiscal year ended, e.g. {2026: "2026-01-31"} for Walmart.
+
+    Companies name fiscal years differently, so we label the newest year using
+    the company's own pattern and count back from there. That keeps one row
+    per year even when a 52/53-week calendar moves the year-end across New
+    Year's Day.
+    """
+    periods = [entry
+               for tag in ALL_INCOME_TAGS
+               for entry in usd_entries_oldest_first(facts, tag)
+               if is_annual_report(entry) and is_full_year(entry)]
+    if not periods:
+        return {}
+
+    # The newest period in each filing is the year that filing reports on.
+    # Older periods in it are comparatives.
+    main_entry_of_filing = {}
+    for entry in periods:
+        current = main_entry_of_filing.get(entry["accn"])
+        if current is None or entry["end"] > current["end"]:
+            main_entry_of_filing[entry["accn"]] = entry
+    main_entries = list(main_entry_of_filing.values())
+    main_periods = {entry["end"] for entry in main_entries}
+
+    newest_end = date.fromisoformat(max(entry["end"] for entry in periods))
+    newest_label = year_it_ended(newest_end) + fiscal_label_offset(main_entries)
+
+    year_ends = {}
+    for end_text in sorted({entry["end"] for entry in periods}):  # oldest to newest
+        days_back = (newest_end - date.fromisoformat(end_text)).days
+        years_back = round(days_back / 365.25)
+        # Skip 12-month comparatives that don't line up with a real year-end,
+        # unless a filing actually reported on that date (a changed fiscal year)
+        off_schedule = abs(days_back - years_back * 365.25) > 15
+        if off_schedule and end_text not in main_periods:
+            continue
+        year_ends[newest_label - years_back] = end_text
+    return year_ends
+
+
+def get_annual_entries(facts, tags, year_ends):
+    """Find one full-year entry per fiscal year for a line item, checking each tag in turn."""
+    year_of_end_date = {end: year for year, end in year_ends.items()}
     yearly = {}
     for tag in tags:
-        if tag not in us_gaap:
-            continue
-        for entry in us_gaap[tag]["units"].get("USD", []):
-            frame = entry.get("frame", "")
-            # A frame like "CY2023" marks a full-year figure. The SEC has
-            # already removed duplicates (the same number repeated in later
-            # 10-Ks as a comparative year).
-            if len(frame) == 6 and frame.startswith("CY"):
-                year = int(frame[2:])
-                # Keep the first tag's entry if two tags cover the same year
-                yearly.setdefault(year, {**entry, "tag": tag})
+        # The same number repeats in later 10-Ks as a comparative year. Going
+        # oldest filing to newest means a restated number replaces the original.
+        found = {}
+        for entry in usd_entries_oldest_first(facts, tag):
+            if (is_annual_report(entry) and is_full_year(entry)
+                    and entry["end"] in year_of_end_date):
+                found[year_of_end_date[entry["end"]]] = {**entry, "tag": tag}
+        # Keep the first tag's entry if two tags cover the same year
+        for year, entry in found.items():
+            yearly.setdefault(year, entry)
     return yearly
-
-
-def get_year_end_dates(facts, tags):
-    """
-    Find the date each fiscal year ended, e.g. {2024: "2024-09-28"} for Apple.
-
-    Balance sheet numbers don't have a "CY2024" frame like income statement
-    numbers do, so we use these dates to pick the balance sheet that goes
-    with each year's income statement.
-    """
-    return {year: entry["end"] for year, entry in get_annual_entries(facts, tags).items()}
 
 
 def get_balance_entries(facts, tags, year_ends):
     """Find the balance on each fiscal year-end date for a balance sheet item."""
-    us_gaap = us_gaap_facts(facts)
     yearly = {}
     for tag in tags:
-        if tag not in us_gaap:
-            continue
         # The same balance shows up in several filings (e.g. as last year's
         # comparative column). Go oldest filing to newest so that if a number
         # was later restated, the most recent version wins.
-        entries = sorted(us_gaap[tag]["units"].get("USD", []), key=lambda e: e["filed"])
         balance_on = {}
-        for entry in entries:
-            if "start" not in entry:  # balance sheet items have no start date
+        for entry in usd_entries_oldest_first(facts, tag):
+            # Balance sheet items have no start date
+            if "start" not in entry and is_annual_report(entry):
                 balance_on[entry["end"]] = {**entry, "tag": tag}
         for year, end_date in year_ends.items():
             if end_date in balance_on:
@@ -189,15 +364,15 @@ def build_financials(facts):
     line item, in dollars. Includes every year available, not just the last
     five, because averages need the prior year's ending balance.
 
-    Also returns a second table recording where each number came from.
+    Also returns a table recording where each number came from, and a
+    dictionary of the date each fiscal year ended.
     """
     cik = facts.get("cik")
-    all_income_tags = [tag for tags in INCOME_ITEMS.values() for tag in tags]
-    year_ends = get_year_end_dates(facts, all_income_tags)
+    year_ends = get_fiscal_year_ends(facts)
 
     entries = {}
     for label, tags in INCOME_ITEMS.items():
-        entries[label] = get_annual_entries(facts, tags)
+        entries[label] = get_annual_entries(facts, tags, year_ends)
     for label, tags in BALANCE_ITEMS.items():
         entries[label] = get_balance_entries(facts, tags, year_ends)
 
@@ -262,21 +437,30 @@ def build_financials(facts):
     sources = pd.DataFrame(
         sources, columns=["Line item", "Year", "Source", "Form", "Filed", "Filing"]
     )
-    return table, sources
+    return table, sources, year_ends
 
 
 def main():
     ticker = input("Enter a ticker symbol: ").strip()
-    cik, name = get_cik(ticker)
-    if cik is None:
-        print(f"Couldn't find a company with ticker {ticker}.")
+    try:
+        cik, name = get_cik(ticker)
+        if cik is None:
+            print(f"Couldn't find a company with ticker {ticker}.")
+            return
+
+        print(f"\n{name} (CIK {cik})\n")
+        facts = get_company_facts(cik)
+    except SecDataError as error:
+        print(error)
         return
 
-    print(f"\n{name} (CIK {cik})\n")
-    facts = get_company_facts(cik)
+    reason = unsupported_reason(facts)
+    if reason:
+        print(f"{name} {reason}")
+        return
 
     # Last five years, in $ millions, flipped so years run across the top
-    table, _ = build_financials(facts)
+    table, _, _ = build_financials(facts)
     print((table.tail(5) / 1_000_000).T.round(0).to_string())
 
 

@@ -17,6 +17,35 @@ LEVERAGE_GROWTH = 0.25      # liabilities to equity up 25% or more in a year
 MATERIALITY = 0.01          # skip receivables/inventory checks when the item
                             # is under 1% of total assets: too small to matter
 
+# SEC industry codes for banks, credit companies, brokers and insurers.
+# REITs (6798) sit just outside this range on purpose.
+FINANCIAL_SIC_CODES = range(6000, 6500)
+
+# What each check needs: the line items, and whether it compares with the prior year.
+CHECK_INPUTS = {
+    "Receivables growing faster than revenue": (["Accounts receivable", "Revenue"], True),
+    "Profits not backed by cash": (["Operating cash flow", "Net income"], False),
+    "Net income up, operating cash flow down": (["Net income", "Operating cash flow"], True),
+    "Earnings growth driven by non-operating items": (["Net income", "Operating income"], True),
+    "Negative free cash flow": (["Operating cash flow", "Free cash flow"], False),
+    "Inventory building up": (["Inventory", "Cost of revenue"], True),
+    "Revenue declined": (["Revenue"], True),
+    "Profit margin squeezed": (["Net income", "Revenue"], True),
+    "Net loss": (["Net income"], False),
+    "Current liabilities exceed current assets": (
+        ["Current assets", "Current liabilities"], False),
+    "Negative stockholders' equity": (["Stockholders' equity"], False),
+    "Leverage rising quickly": (["Total liabilities", "Stockholders' equity"], True),
+}
+
+# These don't apply to banks and insurers, so they don't count as missing
+NOT_FOR_FINANCIAL_COMPANIES = {
+    "Profits not backed by cash",
+    "Net income up, operating cash flow down",
+    "Negative free cash flow",
+    "Current liabilities exceed current assets",
+}
+
 
 def growth(series):
     """Growth from the prior year to the latest year, e.g. 0.08 for 8%."""
@@ -53,7 +82,15 @@ def is_material(fin, item):
     return balance / total_assets >= MATERIALITY
 
 
-def looks_like_financial_company(fin):
+def has_unclassified_balance_sheet(fin):
+    """True if the company reports total assets but no current/noncurrent split."""
+    latest = fin.iloc[-1]
+    return bool(pd.notna(latest["Total assets"])
+                and pd.isna(latest["Current assets"])
+                and pd.isna(latest["Current liabilities"]))
+
+
+def looks_like_financial_company(fin, sic=None):
     """
     True if the company looks like a bank, insurer or broker.
 
@@ -61,14 +98,35 @@ def looks_like_financial_company(fin):
     noncurrent, so they report total assets but no current assets or current
     liabilities. Their cash flows and leverage work differently: deposits are
     liabilities, and trading activity swings operating cash flow by billions.
+
+    REITs and some manufacturers (like Deere) also skip the split, so the SEC
+    industry code confirms it when we have one.
     """
-    latest = fin.iloc[-1]
-    return (pd.notna(latest["Total assets"])
-            and pd.isna(latest["Current assets"])
-            and pd.isna(latest["Current liabilities"]))
+    if not has_unclassified_balance_sheet(fin):
+        return False
+    return sic is None or sic in FINANCIAL_SIC_CODES
 
 
-def check_red_flags(fin, ratios):
+def checks_missing_data(fin, sic=None):
+    """
+    Titles of the checks that couldn't run because a line item is blank.
+
+    Without this, a company with missing data would look like it passed.
+    """
+    if len(fin) < 2:
+        return list(CHECK_INPUTS)
+    financial_company = looks_like_financial_company(fin, sic)
+    missing = []
+    for title, (items, needs_prior_year) in CHECK_INPUTS.items():
+        if financial_company and title in NOT_FOR_FINANCIAL_COMPANIES:
+            continue
+        rows = fin[items].iloc[-2:] if needs_prior_year else fin[items].iloc[-1:]
+        if rows.isna().any(axis=None):
+            missing.append(title)
+    return missing
+
+
+def check_red_flags(fin, ratios, sic=None):
     """
     Run every check on the financials (in dollars) and ratios tables.
     Returns a list of flags, each with a title, the numbers, and why it matters.
@@ -79,7 +137,7 @@ def check_red_flags(fin, ratios):
 
     year = fin.index[-1]
     # Cash flow checks don't fit banks and insurers (see the function above)
-    financial_company = looks_like_financial_company(fin)
+    financial_company = looks_like_financial_company(fin, sic)
 
     def flag(title, detail, why):
         flags.append({"title": title, "detail": detail, "why": why})
